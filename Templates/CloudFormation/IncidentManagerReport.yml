@@ -1,0 +1,374 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AWS CloudFormation template to create a report for AWS Systems Manager Incident Manager and save it on Amazon Amazon S3 using AWS Systems Manager Automation.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Input Parameters"
+        Parameters:
+          - RunOnSchedule
+          - AssociationSchedule
+Parameters:
+  RunOnSchedule:
+    Type: String
+    Description: Scheduled the process vs running on-demand.
+    Default: false
+    AllowedValues:
+      - true
+      - false
+  AssociationSchedule:
+    Type: String
+    Description: >-
+      The cron expression to use for the association in UTC. For more information about this format, see https://docs.aws.amazon.com/systems-manager/latest/userguide/reference-cron-and-rate-expressions.html#reference-cron-and-rate-expressions-association.
+    Default: "cron(0 2 ? * SUN *)"
+Conditions:
+  WithSchedule:
+    Fn::Equals:
+      - Ref: RunOnSchedule
+      - true
+Resources:
+  AWSSystemsManagerAutomationRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole"
+      Path: /
+      Policies:
+        - PolicyName: AWS-Incident-Manager-Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ssm-incidents:ListIncidentRecords"
+                  - "ssm-incidents:ListRelatedItems"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:PutObjectAcl"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}"
+                  - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}/IMReport-*"
+      Tags:
+        - Key: cloudformation:logical-id
+          Value: AWSSystemsManagerAutomationRole
+        - Key: cloudformation:stack-id
+          Value: !Ref AWS::StackId
+        - Key: cloudformation:stack-name
+          Value: !Ref AWS::StackName
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+  SystemsManagerAutomationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentFormat: YAML
+      DocumentType: Automation
+      Content:
+        description: Systems Manager automation document to generate Incident Manager reporting
+        schemaVersion: "0.3"
+        assumeRole: "{{AutomationAssumeRole}}"
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: "(Required) The Amazon Resource Name (ARN) of the IAM role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to operate this runbook."
+          S3BucketName:
+            type: String
+            description: "(Required) To store the Incident Manager reporting CSV file"
+            default: !Ref S3Bucket
+        mainSteps:
+          - name: IncidentReports
+            action: "aws:executeScript"
+            inputs:
+              Runtime: python3.8
+              Handler: lambda_handler
+              InputPayload:
+                S3bucketname: "{{S3BucketName}}"
+                CSVpath: /tmp/IMreport.csv
+              Script: |-
+                import boto3
+                import json
+                import csv
+                import os
+                import logging
+                from datetime import datetime, date
+                import botocore
+
+                # creating service clients
+                SSMIncidents = boto3.client('ssm-incidents')
+                s3 = boto3.resource('s3')
+
+                # set logger
+                logger = logging.getLogger()
+                logger.setLevel(logging.INFO)
+
+                # Main lambda function that calls all sub functions
+                def lambda_handler(event,context):
+
+                    # Declare bucket name and csv path as global variables
+                    global S3bucketname, CSVpath
+
+                    S3bucketname = event['S3bucketname']
+                    CSVpath = event['CSVpath']
+
+                    # related_items
+                    outputcsv = related_items()
+                    logging.info(outputcsv)
+
+                    # Write filtered incident records to CSV
+                    generate_csv(outputcsv, CSVpath)
+                    f = open(CSVpath, "r")
+                    logging.info(f.read())
+
+                    # generate an s3 object name
+                    S3ObjectName = report_name()
+                    logging.info(S3ObjectName)
+
+                    # create an s3 object
+                    S3Upload(S3bucketname, S3ObjectName, CSVpath)
+
+                    # delete the csv file following the successful upload
+                    os.remove(CSVpath)
+
+                    return {
+                        "s3_bucket": S3bucketname,
+                        "s3_object": S3ObjectName,
+                        "status": "success"
+                    }
+
+                # List Incident_Records
+                def incident_records() -> list:
+
+                    # List Incident Records
+                    try:
+                        response = SSMIncidents.list_incident_records(
+                            filters=[
+                                {
+                                    'condition': {
+                                        'equals': {
+                                            'stringValues': [
+                                                'RESOLVED',
+                                                'OPEN'
+                                            ]
+                                        }
+                                    },
+                                    'key': 'status'
+                                },
+                            ]
+                        )
+                        incidentrecords = response['incidentRecordSummaries']
+                        while "NextToken" in response:
+                            response = SSMIncidents.list_incident_records(NextToken = response['NextToken'])
+                            incidentrecords.extend(response['incidentRecordSummaries'])
+                        return incidentrecords
+                    except Exception as err:
+                        logging.error(f"Unexpected {err=}, {type(err)=}")
+                        raise
+
+                # Filter output
+                def related_items() -> list:
+                    incidentrecords = incident_records()
+                    outputs = []
+                    for i in incidentrecords:
+
+                        # Extracting response plan from Incident ARN
+                        split_arn = i["arn"].split('/')
+                        response_plan = split_arn[-2]
+
+                        # Add a blank for resolved times if the Status is Open
+                        if i["status"] != "OPEN":
+                            resolved_time = i["resolvedTime"]
+                        else:
+                            resolved_time = ""
+
+                        # Add a blank if there is no resource_arn
+                        resource_arn = i["incidentRecordSource"].get("resourceArn", "")
+
+                        # Time Duration
+                        Duration = ""
+                        if i["status"] == "RESOLVED" and i["creationTime"] and resolved_time:
+                            StartTime = datetime.strptime(str(i["creationTime"]), "%Y-%m-%d %H:%M:%S.%f%z")
+                            EndTime = datetime.strptime(str(resolved_time), "%Y-%m-%d %H:%M:%S.%f%z")
+                            time_delta = EndTime - StartTime
+                            days = time_delta.days
+                            hours = time_delta.seconds // 3600
+                            minutes = (time_delta.seconds // 60) % 60
+                            seconds = time_delta.seconds % 60
+
+                            total_seconds = time_delta.total_seconds()
+                            if total_seconds < 60:
+                                Duration = f"{seconds}s"
+                            elif total_seconds < 3600:
+                                Duration = f"{minutes}m {seconds}s"
+                            elif total_seconds < 86400:
+                                Duration = f"{hours}h {minutes}m {seconds}s"
+                            else:
+                                Duration = f"{days}d {hours}h {minutes}m {seconds}s"
+
+                        # Call List Related Items API
+                        try:
+                            response = SSMIncidents.list_related_items(
+                                incidentRecordArn=i["arn"]
+                            )
+                            related_items = response["relatedItems"]
+
+                            while "NextToken" in response:
+                                response = SSMIncidents.list_related_items(NextToken = response['NextToken'])
+                                related_items.extend(response['relatedItems'])
+
+                            # Allowed Types in related items = "ANALYSIS"|"INCIDENT"|"METRIC"|"PARENT"|"ATTACHMENT"|"OTHER"|"AUTOMATION"|"INVOLVED_RESOURCE"|"TASK"
+                            # Allowed values = "arn" | "metricDefinition" | "pagerDutyIncidentDetail" | "url"
+
+                            # Initialize a dictionary to store identifier lists based on their types
+                            identifier_mapping = {
+                                "PARENT": [],
+                                "INVOLVED_RESOURCE": [],
+                                "ANALYSIS": [],
+                                "OTHER": [],
+                                "INCIDENT": [],
+                                "AUTOMATION": [],
+                                "TASK": [],
+                                "ATTACHMENT":[],
+                                "METRIC":[]
+                            }
+
+                            # Iterate through the related items and append identifier values to respective lists
+                            for j in related_items:
+                                type = j["identifier"]["type"]
+                                values = j["identifier"]["value"]
+
+                                # Check if the value is from pagerDuty and append respective ID with prefix 'PagerDuty Incident ID'
+                                if values.get("pagerDutyIncidentDetail"):
+                                    identifier_value = "PagerDuty Incident ID " + str(values.get("pagerDutyIncidentDetail").get("id"))
+
+                                # For all other values, append directly
+                                else:
+                                    identifier_value = values.get("arn") or values.get("url") or values.get("metricDefinition")
+
+                                if identifier_value:
+                                    if type in identifier_mapping:
+                                        identifier_mapping[type].append(identifier_value)
+                                    else:
+                                        identifier_mapping["OTHER"].append(identifier_value) # Add the value to OTHER if the type is not recognized
+
+                        except Exception as err:
+                            logging.error(f"Unexpected {err=}, {type(err)=}")
+                            raise
+
+                        # Convert identifiers from list to string
+                        parent_items = ','.join(identifier_mapping.get("PARENT", []))
+                        involvedresource_arns = ','.join(identifier_mapping.get("INVOLVED_RESOURCE", []))
+                        analysis_arns = ','.join(identifier_mapping.get("ANALYSIS", []))
+                        other_items = ','.join(identifier_mapping.get("OTHER", []))
+                        related_incidents = ','.join(identifier_mapping.get("INCIDENT", []))
+                        automation = ','.join(identifier_mapping.get("AUTOMATION", []))
+                        related_tasks = ','.join(identifier_mapping.get("TASK", []))
+                        related_attachments = ','.join(identifier_mapping.get("ATTACHMENT", []))
+                        related_metrics = ','.join(identifier_mapping.get("METRIC", []))
+
+                        # Append all the elements to outputs list
+                        output = [i["title"], i["arn"], i["impact"], i["status"], response_plan, i["creationTime"], resolved_time, Duration, resource_arn, parent_items, involvedresource_arns, related_incidents, automation, analysis_arns, related_tasks, related_attachments, related_metrics, other_items]
+                        outputs.append(output)
+
+                    return outputs
+
+
+                # Write incident records to CSV
+                def generate_csv(event_data, file_path):
+                    # field names for a csv file
+                    fields = ['Title', 'Incident ARN', 'Impact', 'Status', 'Response Plan', 'Start Time', 'Resolved Time', 'Duration', 'Invoked Resource ARN', 'Related Parent Items', 'Related Involved Resources', 'Related Incidents', 'Related Automations', 'Related Analysis', 'Related Tasks', 'Related Attachments', 'Related Metrics', 'Other Related Items']  # Add more header fields if needed
+                    with open(file_path, 'w', newline='', encoding='utf-8') as output_file:
+                        # creating a csv writer object and write rows
+                        try:
+                            csvwriter = csv.writer(output_file, delimiter=',', )
+                            csvwriter.writerow(fields)
+                            csvwriter.writerows(event_data)
+                        except Exception as err:
+                            logging.error(f"Unexpected {err=}, {type(err)=}")
+                            raise
+
+                # Generate an object name
+                def report_name() -> str:
+                    today = date.today()
+                    current_time = datetime.now().strftime("%H:%M:%S")
+                    return f"IMReport-{today}-{current_time} UTC.csv"
+
+                # Upload CSV to S3
+                def S3Upload(S3bucketName, object_key, file_path):
+                    logging.info(f"uploading {object_key} to {S3bucketName}")
+                    try:
+                        s3.meta.client.upload_file(
+                            Filename=file_path,
+                            Bucket=S3bucketName,
+                            Key=object_key,
+                            ExtraArgs={'ACL': 'bucket-owner-full-control'}
+                        )
+                    except Exception as err:
+                        logging.error(f"Unexpected {err=}, {type(err)=}")
+                        raise
+        outputs:
+          - IncidentReports.OutputPayload
+      Tags:
+        - Key: cloudformation:logical-id
+          Value: SystemsManagerAutomationDocument
+        - Key: cloudformation:stack-id
+          Value: !Ref AWS::StackId
+        - Key: cloudformation:stack-name
+          Value: !Ref AWS::StackName
+  StateManagerAssociation:
+    Condition: WithSchedule
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: "Report-generator-for-Incident-Manager"
+      Name: !Ref SystemsManagerAutomationDocument
+      ScheduleExpression: !Ref AssociationSchedule
+      ApplyOnlyAtCronInterval: true
+      Parameters:
+        AutomationAssumeRole:
+          - !GetAtt AWSSystemsManagerAutomationRole.Arn
+        S3BucketName:
+          - !Ref S3Bucket
+Outputs:
+  S3Bucket:
+    Description: S3 bucket to store AWS Systems Manager Incident Manager report.
+    Value: !Ref S3Bucket
+  AWSSystemsManagerAutomationRole:
+    Description: AWS Systems Manager Automation Execution Role
+    Value: !Ref AWSSystemsManagerAutomationRole
+  SystemsManagerAutomationDocument:
+    Description: Systems Manager Automation Document to generate the report.
+    Value: !Ref SystemsManagerAutomationDocument
+  StateManagerAssociation:
+    Condition: WithSchedule
+    Description: Systems Manager state manager association to schedule the generation of the report.
+    Value: !Ref StateManagerAssociation
