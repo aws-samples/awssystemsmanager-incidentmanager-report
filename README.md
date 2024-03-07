@@ -34,6 +34,8 @@ The stack template includes the following parameters:
 | RunOnSchedule | Optional | Scheduled the process vs running on-demand. |
 | AssociationSchedule | Optional | The [cron expression](https://docs.aws.amazon.com/systems-manager/latest/userguide/reference-cron-and-rate-expressions.html#reference-cron-and-rate-expressions-association) to use for the association in UTC. |
 
+If you set `RunOnSchedule` parameter to `false` in the template, CloudFormation will create the required Systems Manager Automation document and other resources, however you would need to manually execute the above created automation document to generate report.
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
