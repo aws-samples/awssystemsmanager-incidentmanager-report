@@ -89,13 +89,13 @@ Resources:
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
-  SystemsManagerAutomationDocument:
+  SystemsManagerAutomationRunbook:
     Type: AWS::SSM::Document
     Properties:
       DocumentFormat: YAML
       DocumentType: Automation
       Content:
-        description: Systems Manager automation document to generate Incident Manager reporting
+        description: Systems Manager Automation Runbook to generate Incident Manager reporting
         schemaVersion: "0.3"
         assumeRole: "{{AutomationAssumeRole}}"
         parameters:
@@ -340,7 +340,7 @@ Resources:
           - IncidentReports.OutputPayload
       Tags:
         - Key: cloudformation:logical-id
-          Value: SystemsManagerAutomationDocument
+          Value: SystemsManagerAutomationRunbook
         - Key: cloudformation:stack-id
           Value: !Ref AWS::StackId
         - Key: cloudformation:stack-name
@@ -350,7 +350,7 @@ Resources:
     Type: AWS::SSM::Association
     Properties:
       AssociationName: "Report-generator-for-Incident-Manager"
-      Name: !Ref SystemsManagerAutomationDocument
+      Name: !Ref SystemsManagerAutomationRunbook
       ScheduleExpression: !Ref AssociationSchedule
       ApplyOnlyAtCronInterval: true
       Parameters:
@@ -365,9 +365,9 @@ Outputs:
   AWSSystemsManagerAutomationRole:
     Description: AWS Systems Manager Automation Execution Role
     Value: !Ref AWSSystemsManagerAutomationRole
-  SystemsManagerAutomationDocument:
-    Description: Systems Manager Automation Document to generate the report.
-    Value: !Ref SystemsManagerAutomationDocument
+  SystemsManagerAutomationRunbook:
+    Description: Systems Manager Automation Runbook to generate the report.
+    Value: !Ref SystemsManagerAutomationRunbook
   StateManagerAssociation:
     Condition: WithSchedule
     Description: Systems Manager state manager association to schedule the generation of the report.
