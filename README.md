@@ -1,4 +1,4 @@
-# Automate the reporting of Incident Manager
+# Automate Incident Reports from AWS Systems Manager Incident Manager
 
 This repo hosts templates written for the AWS Blog Post "[Automate Incident Reports from AWS Systems Manager Incident Manager](https://aws.amazon.com/blogs/mt/automate-incident-reports-from-aws-systems-manager-incident-manager)" published on the [AWS Cloud Operations & Migrations](https://aws.amazon.com/blogs/mt/) blog channel.
 
