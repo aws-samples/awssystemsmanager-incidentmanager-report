@@ -1,6 +1,6 @@
 # Automate the reporting of Incident Manager
 
-This repo hosts templates written for the AWS Blog Post "[Automate the reporting of Incident Manager](https://aws.amazon.com/blogs/mt/automate-the-reporting-of-incident-manager)" published on the [AWS Cloud Operations & Migrations](https://aws.amazon.com/blogs/mt/) blog channel.
+This repo hosts templates written for the AWS Blog Post "[Automate the reporting of Incident Manager](https://aws.amazon.com/blogs/mt/automate-incident-reports-from-aws-systems-manager-incident-manager)" published on the [AWS Cloud Operations & Migrations](https://aws.amazon.com/blogs/mt/) blog channel.
 
 ## Overview
 The solution will demonstrate the process of generating insightful reports within Incident Manager. Our goal is to show you a step by step for generating regular reports and storing them in Amazon Simple Storage Service (Amazon S3). This solution helps you to:
