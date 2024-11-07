@@ -67,15 +67,19 @@ Resources:
                   - "ssm-incidents:ListIncidentRecords"
                   - "ssm-incidents:ListRelatedItems"
                 Resource: "*"
-              - Effect: Allow
-                Action:
-                  - "s3:PutObject"
-                  - "s3:GetObject"
-                  - "s3:ListBucket"
-                  - "s3:PutObjectAcl"
+              - Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:PutObjectAcl
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}"
-                  - !Sub "arn:${AWS::Partition}:s3:::${S3Bucket}/IMReport-*"
+                  - !Sub arn:${AWS::Partition}:s3:::${S3Bucket}/*
+                Effect: Allow
+              - Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt S3Bucket.Arn
+                Effect: Allow
       Tags:
         - Key: cloudformation:logical-id
           Value: AWSSystemsManagerAutomationRole
@@ -89,13 +93,13 @@ Resources:
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
-  SystemsManagerAutomationRunbook:
+  SystemsManagerAutomationDocument:
     Type: AWS::SSM::Document
     Properties:
       DocumentFormat: YAML
       DocumentType: Automation
       Content:
-        description: Systems Manager Automation Runbook to generate Incident Manager reporting
+        description: Systems Manager automation document to generate Incident Manager reporting
         schemaVersion: "0.3"
         assumeRole: "{{AutomationAssumeRole}}"
         parameters:
@@ -110,11 +114,13 @@ Resources:
           - name: IncidentReports
             action: "aws:executeScript"
             inputs:
-              Runtime: python3.8
+              Runtime: python3.11
               Handler: lambda_handler
               InputPayload:
                 S3bucketname: "{{S3BucketName}}"
                 CSVpath: /tmp/IMreport.csv
+                HTMLpath: /tmp/IMreport.html
+                account_id: "{{global:ACCOUNT_ID}}"
               Script: |-
                 import boto3
                 import json
@@ -127,6 +133,8 @@ Resources:
                 # creating service clients
                 SSMIncidents = boto3.client('ssm-incidents')
                 s3 = boto3.resource('s3')
+                s3_client = boto3.client('s3')
+                ssm = boto3.client('ssm')
 
                 # set logger
                 logger = logging.getLogger()
@@ -136,33 +144,38 @@ Resources:
                 def lambda_handler(event,context):
 
                     # Declare bucket name and csv path as global variables
-                    global S3bucketname, CSVpath
+                    global S3bucketname, CSVpath, HTMLpath, account_id
 
                     S3bucketname = event['S3bucketname']
                     CSVpath = event['CSVpath']
+                    HTMLpath = event['HTMLpath']
+                    account_id = event['account_id']
 
                     # related_items
                     outputcsv = related_items()
-                    logging.info(outputcsv)
 
                     # Write filtered incident records to CSV
                     generate_csv(outputcsv, CSVpath)
-                    f = open(CSVpath, "r")
-                    logging.info(f.read())
+
+                    # Write the reports to HTML
+                    generate_html(outputcsv, HTMLpath)
 
                     # generate an s3 object name
-                    S3ObjectName = report_name()
-                    logging.info(S3ObjectName)
+                    S3CSVObjectName = generate_report_name("csv")
+                    S3HTMLObjectName = generate_report_name("html")
 
                     # create an s3 object
-                    S3Upload(S3bucketname, S3ObjectName, CSVpath)
+                    S3Upload(S3bucketname, S3CSVObjectName, CSVpath)
+                    S3Upload(S3bucketname, S3HTMLObjectName, HTMLpath)
 
                     # delete the csv file following the successful upload
                     os.remove(CSVpath)
+                    os.remove(HTMLpath)
 
                     return {
                         "s3_bucket": S3bucketname,
-                        "s3_object": S3ObjectName,
+                        "s3_csv_report": S3CSVObjectName,
+                        "s3_html_report": S3HTMLObjectName,
                         "status": "success"
                     }
 
@@ -296,17 +309,96 @@ Resources:
                         related_attachments = ','.join(identifier_mapping.get("ATTACHMENT", []))
                         related_metrics = ','.join(identifier_mapping.get("METRIC", []))
 
+                        # Get SSM document content and save to S3
+                        analysis_urls = []
+
+                        for arn in identifier_mapping["ANALYSIS"]:
+
+                            # Split the ARN and extract the account number
+                            arn_parts = arn.split(':')
+                            account_number = arn_parts[4] if len(arn_parts) > 4 else None
+
+                            # Save the analysis only if automation runs in the same account as that of analysis arn
+                            if account_number == account_id:
+                                content = get_analysis_document(arn)
+                                if content:
+                                    s3_url = save_analysis_to_s3(content, i["title"], arn)
+                                    if s3_url:
+                                        analysis_urls.append(s3_url)
+
+                        # Join the analysis URLs
+                        analysis_urls_str = ','.join(analysis_urls)
+
                         # Append all the elements to outputs list
-                        output = [i["title"], i["arn"], i["impact"], i["status"], response_plan, i["creationTime"], resolved_time, Duration, resource_arn, parent_items, involvedresource_arns, related_incidents, automation, analysis_arns, related_tasks, related_attachments, related_metrics, other_items]
+                        output = [i["title"], i["arn"], i["impact"], i["status"], response_plan, i["creationTime"], resolved_time, Duration, resource_arn, parent_items, involvedresource_arns, related_incidents, automation, analysis_arns, analysis_urls_str, related_tasks, related_attachments, related_metrics, other_items]
                         outputs.append(output)
 
                     return outputs
+
+                def get_analysis_document(arn):
+                    try:
+                        response = ssm.get_document(Name=arn)
+                        return response['Content']
+                    except Exception as e:
+                        print(f"Error getting SSM document for ARN {arn}: {str(e)}")
+                        return None
+
+                def save_analysis_to_s3(content, incident_name, analysis_arn):
+                    try:
+                        # Remove spaces and any special character from Incident Name
+                        incident_name_new = ''.join(e for e in incident_name if e.isalnum())
+
+                        # Extract the analysis document ID from the ARN
+                        document_id = analysis_arn.split('/')[-1]
+                        document_name = f"analysis_summary_{document_id}.txt"
+
+                        # Create the S3 key
+                        key = f"analyses/{incident_name_new}/{document_name}"
+
+                        # Parse the JSON content
+                        data = json.loads(content)
+
+                        # Extract Incident Summary and Impact from `AWSIncidents-PostIncidentAnalysisTemplate`
+                        incident_summary = "Not provided"
+                        impact = "Not provided"
+
+                        for section in data.get('template', {}).get('sections', []):
+                            if section.get('id') == 'overview':
+                                for component in section.get('components', []):
+                                    questions = component.get('questions', {})
+                                    if questions.get('title') == 'Incident summary':
+                                        for question in questions.get('questions', []):
+                                            if 'value' in question and 'markdown' in question['value']:
+                                                incident_summary = question['value']['markdown'].get('answer', 'Not provided')
+                                                break
+                                    elif questions.get('title') == 'Impact':
+                                        for question in questions.get('questions', []):
+                                            if 'value' in question and 'markdown' in question['value']:
+                                                impact = question['value']['markdown'].get('answer', 'Not provided')
+                                                break
+
+                        # Prepare the content for the text file
+                        text_content = f"Incident Summary:\n{incident_summary}\n\nImpact:\n{impact}"
+
+                        # Upload the content to S3
+                        s3_client.put_object(Bucket=S3bucketname, Key=key, Body=text_content)
+
+                        # Get bucket region
+                        region_id = s3_client.get_bucket_location(Bucket=S3bucketname)['LocationConstraint'] or 'us-east-1'
+
+                        # Generate the S3 URL
+                        s3_url = f"https://s3.console.aws.amazon.com/s3/object/{S3bucketname}/{key}?region={region_id}"
+
+                        return s3_url
+                    except Exception as e:
+                        print(f"Error saving to S3: {str(e)}")
+                        return None
 
 
                 # Write incident records to CSV
                 def generate_csv(event_data, file_path):
                     # field names for a csv file
-                    fields = ['Title', 'Incident ARN', 'Impact', 'Status', 'Response Plan', 'Start Time', 'Resolved Time', 'Duration', 'Invoked Resource ARN', 'Related Parent Items', 'Related Involved Resources', 'Related Incidents', 'Related Automations', 'Related Analysis', 'Related Tasks', 'Related Attachments', 'Related Metrics', 'Other Related Items']  # Add more header fields if needed
+                    fields = ['Title', 'Incident ARN', 'Impact', 'Status', 'Response Plan', 'Start Time', 'Resolved Time', 'Duration', 'Invoked Resource ARN', 'Related Parent Items', 'Related Involved Resources', 'Related Incidents', 'Related Automations', 'Related Analysis', 'Analysis Summary', 'Related Tasks', 'Related Attachments', 'Related Metrics', 'Other Related Items']  # Add more header fields if needed
                     with open(file_path, 'w', newline='', encoding='utf-8') as output_file:
                         # creating a csv writer object and write rows
                         try:
@@ -317,11 +409,102 @@ Resources:
                             logging.error(f"Unexpected {err=}, {type(err)=}")
                             raise
 
-                # Generate an object name
-                def report_name() -> str:
+                # Write incident records to HTML
+                def generate_html(event_data, file_path):
+                    # HTML template
+                    html_template = """
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                        <meta charset="UTF-8">
+                        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                        <title>Incident Report</title>
+                        <style>
+                            table {{
+                                border-collapse: collapse;
+                                width: 100%;
+                            }}
+                            th, td {{
+                                border: 1px solid #ddd;
+                                padding: 8px;
+                                text-align: left;
+                            }}
+                            th {{
+                                background-color: #f2f2f2;
+                            }}
+                            tr:nth-child(even) {{
+                                background-color: #f9f9f9;
+                            }}
+                            .summary-link {{
+                                background-color: #ffff00;
+                                color: #0000ff;
+                                text-decoration: underline;
+                                font-weight: bold;
+                                padding: 2px 5px;
+                            }}
+                        </style>
+                    </head>
+                    <body>
+                        <h1>Incident Report</h1>
+                        <p>Generated on: {generation_time}</p>
+                        <table>
+                            <tr>
+                                <th>Title</th>
+                                <th>Incident ARN</th>
+                                <th>Impact</th>
+                                <th>Status</th>
+                                <th>Response Plan</th>
+                                <th>Start Time</th>
+                                <th>Resolved Time</th>
+                                <th>Duration</th>
+                                <th>Invoked Resource ARN</th>
+                                <th>Related Parent Items</th>
+                                <th>Related Involved Resources</th>
+                                <th>Related Incidents</th>
+                                <th>Related Automations</th>
+                                <th>Related Analysis</th>
+                                <th>Analysis Summary</th>
+                                <th>Related Tasks</th>
+                                <th>Related Attachments</th>
+                                <th>Related Metrics</th>
+                                <th>Other Related Items</th>
+                            </tr>
+                            {table_rows}
+                        </table>
+                    </body>
+                    </html>
+                    """
+
+                    try:
+                        rows = []
+                        for row in event_data:
+                            if row[14]:
+                                summary_cell = f'<a href="{row[14]}" class="summary-link" target="_blank">Click for Analysis Summary</a>'
+                            else:
+                                summary_cell = "N/A"
+
+                            formatted_row = [f"<td>{cell}</td>" for cell in row[:14]] + [f"<td>{summary_cell}</td>"] + [f"<td>{cell}</td>" for cell in row[15:]]
+                            rows.append(f"<tr>{''.join(formatted_row)}</tr>")
+
+                        table_rows = "\n".join(rows)
+                        generation_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                        html_content = html_template.format(table_rows=table_rows, generation_time=generation_time)
+
+                        with open(file_path, 'w', encoding='utf-8') as output_file:
+                            output_file.write(html_content)
+
+                        print(f"HTML report generated: {file_path}")
+
+                    except Exception as err:
+                        logging.error(f"Unexpected {err=}, {type(err)=}")
+                        raise
+
+                # Generate report name
+                def generate_report_name(report_type: str) -> str:
                     today = date.today()
                     current_time = datetime.now().strftime("%H:%M:%S")
-                    return f"IMReport-{today}-{current_time} UTC.csv"
+                    return f"reports/{report_type}/IMReport-{today}-{current_time} UTC.{report_type}"
 
                 # Upload CSV to S3
                 def S3Upload(S3bucketName, object_key, file_path):
@@ -340,7 +523,7 @@ Resources:
           - IncidentReports.OutputPayload
       Tags:
         - Key: cloudformation:logical-id
-          Value: SystemsManagerAutomationRunbook
+          Value: SystemsManagerAutomationDocument
         - Key: cloudformation:stack-id
           Value: !Ref AWS::StackId
         - Key: cloudformation:stack-name
@@ -350,7 +533,7 @@ Resources:
     Type: AWS::SSM::Association
     Properties:
       AssociationName: "Report-generator-for-Incident-Manager"
-      Name: !Ref SystemsManagerAutomationRunbook
+      Name: !Ref SystemsManagerAutomationDocument
       ScheduleExpression: !Ref AssociationSchedule
       ApplyOnlyAtCronInterval: true
       Parameters:
@@ -365,9 +548,9 @@ Outputs:
   AWSSystemsManagerAutomationRole:
     Description: AWS Systems Manager Automation Execution Role
     Value: !Ref AWSSystemsManagerAutomationRole
-  SystemsManagerAutomationRunbook:
-    Description: Systems Manager Automation Runbook to generate the report.
-    Value: !Ref SystemsManagerAutomationRunbook
+  SystemsManagerAutomationDocument:
+    Description: Systems Manager Automation Document to generate the report.
+    Value: !Ref SystemsManagerAutomationDocument
   StateManagerAssociation:
     Condition: WithSchedule
     Description: Systems Manager state manager association to schedule the generation of the report.
